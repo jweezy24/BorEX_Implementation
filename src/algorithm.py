@@ -3,16 +3,79 @@ import argparse
 import csv
 import tqdm
 import random
+import PIL.Image
 
 from sklearn.gaussian_process.kernels import Matern
 from sklearn.gaussian_process import GaussianProcessRegressor
 from PIL import Image
 from transformers import ViTFeatureExtractor, ViTForImageClassification
 from scipy.stats import multivariate_normal
+from smqtk_classifier import ClassifyImage
+from xaitk_saliency import GenerateImageClassifierBlackboxSaliency
+
 
 import numpy as np
 import matplotlib.pyplot as plt
 
+
+
+def app(
+    image_filepath: str,
+    # Assuming outputs `nClass` length arrays.
+    blackbox_classify: ClassifyImage,
+    gen_bb_sal: GenerateImageClassifierBlackboxSaliency,
+):
+    # Load the image
+    ref_image = np.asarray(PIL.Image.open(image_filepath))
+    sal_maps = gen_bb_sal(ref_image, blackbox_classify)
+    print(f"Saliency maps: {sal_maps.shape}")
+    visualize_saliency(ref_image, sal_maps)
+
+    
+def visualize_saliency(ref_image: np.ndarray, sal_maps: np.ndarray) -> None:    
+    # Visualize the saliency heat-maps
+    sub_plot_ind = len(sal_maps) + 1
+    plt.figure(figsize=(12, 6))
+    plt.subplot(2, sub_plot_ind, 1)
+    plt.imshow(ref_image)
+    plt.axis('off')
+    plt.title('Test Image')
+
+    # Some magic numbers here to get colorbar to be roughly the same height
+    # as the plotted image.
+    colorbar_kwargs = {
+        "fraction": 0.046*(ref_image.shape[0]/ref_image.shape[1]),
+        "pad": 0.04,
+    }
+
+    for i, class_sal_map in enumerate(sal_maps):
+        print(f"Class {i} saliency map range: [{class_sal_map.min()}, {class_sal_map.max()}]")
+
+        # Positive half saliency
+        plt.subplot(2, sub_plot_ind, 2+i)
+        plt.imshow(ref_image, alpha=0.7)
+        plt.imshow(
+            np.clip(class_sal_map, 0, 1),
+            cmap='jet', alpha=0.3
+        )
+        plt.clim(0, 1)
+        plt.colorbar(**colorbar_kwargs)
+        plt.title(f"Class #{i+1} Pos Saliency")
+        plt.axis('off')
+
+        # Negative half saliency
+        plt.subplot(2, sub_plot_ind, sub_plot_ind+2+i)
+        plt.imshow(ref_image, alpha=0.7)
+        plt.imshow(
+            np.clip(class_sal_map, -1, 0),
+            cmap='jet_r', alpha=0.3
+        )
+        plt.clim(-1, 0)
+        plt.colorbar(**colorbar_kwargs)
+        plt.title(f"Class #{i+1} Neg Saliency")
+        plt.axis('off')
+    
+    plt.show()
 
 def is_image_file(filename):
     """Check if a file is an image based on its extension."""
@@ -122,6 +185,47 @@ def load_test_model():
 
     return model,transforms
 
+
+  
+class test_model (ClassifyImage):
+    """ Blackbox model to output the two focus classes. """
+    
+    def __init__(self,M,transformer):
+        self.M = M
+        self.transformer = transformer
+    
+    def get_labels(self):
+        self.sal_class_labels = {
+            0: "0-2",
+            1: "3-9",
+            2: "10-19",
+            3: "20-29",
+            4: "30-39",
+            5: "40-49",
+            6: "50-59",
+            7: "60-69",
+            8: "more than 70"}
+        self.t_labels = list(self.sal_class_labels.values())
+        self.t_keys = list(self.sal_class_labels.keys())
+        return self.t_labels
+    
+    def classify_images(self, image_iter):
+        # Input may either be an NDaray, or some arbitrary iterable of NDarray images.
+        
+        for img in image_iter:
+            preped_image = self.transformer(img, return_tensors='pt')
+            output = self.M(**preped_image)
+            proba = output.logits.softmax(1)
+            final_probability = proba[0][proba.argmax(1).item()].item()
+            preds = proba.argmax(1)
+            pred = preds[0].item()
+            lst_translation = proba.detach().numpy().tolist()[0]
+            yield dict(zip(self.t_labels, lst_translation))
+    
+    def get_config(self):
+        # Required by a parent class.
+        return {}
+
 def evaluate_test_model(M,transformer,X,label):
     labels = {
     0: "0-2",
@@ -147,12 +251,200 @@ def evaluate_test_model(M,transformer,X,label):
 
 def create_Q(X,window_len):
     Q = []
-    for i in range(1,window_len):
+    for i in range(0,window_len):
         for j in range(0,X.shape[0]):
             for k in range(0,X.shape[0]):
                 Q.append((j,k,i))
     
     return Q
+
+## 1 to 1 translation from paper (doesn't work)
+def algorithm_attempt1(image_paths,max_window_size,M,transformer,N,init_length,kernel,observable_set_size= 500):
+    window_sizes = [50,64,78,92,107,121,135,150]
+    for data in image_paths.items():
+            samples = []
+            print(data)
+            image_path = data[0]
+            label = data[1]
+            
+            if label == None:
+                continue
+            
+            X = load_image_as_matrix(image_path)
+            Q = create_Q(X,max_window_size)
+            
+            f_X = evaluate_test_model(M,transformer,X,label[0])
+            local_X = []
+            local_Y = []
+
+            optimal_point = [0,0,0]
+            last_improvement = 0
+
+            for c in tqdm.tqdm(range(N+init_length)):
+                
+                
+                # if last_improvement != 0 and abs(EIs.min()-last_improvement) <= 0.0001:
+                #     print("Converged")
+                #     break 
+                
+                if c < init_length:
+                    i = random.choice(window_sizes)
+                    j = random.randint(0,X.shape[0])
+                    k = random.randint(0, X.shape[1])
+
+                    p = (j,k,i)
+                    
+                    while p in samples:
+
+                        i = random.choice(window_sizes)
+                        j = random.randint(0,X.shape[0])
+                        k = random.randint(0, X.shape[1])
+
+                        p = (j,k,i)
+                    
+
+                    
+                else:
+                    p = optimal_point
+                    while p in samples:
+                        index = random.randint(0,2)
+                        
+                        j,k,i= p
+                        if index == 0:
+                            j+=1
+                        elif index == 1:
+                            k+=1
+                        elif index == 2:
+                            i = random.choice(window_sizes)
+                        
+                        p = (j,k,i)
+
+
+                samples.append(p)
+                X_hat = sample_from_D(X,j,k,i)
+                f_X_hat = evaluate_test_model(M,transformer,X_hat,label[0])
+
+                y_i = abs(f_X - f_X_hat)
+
+                local_Y.append(y_i)
+                local_X.append(p)
+                
+                if c < init_length:
+                    continue
+                
+                gpr = GaussianProcessRegressor(kernel=kernel, random_state=0,normalize_y=True).fit(local_X, local_Y)
+                
+                EIs = []
+                
+                observable_set = []
+                
+                ## Generate obserable set
+                for i in range(observable_set_size):
+                    i = random.choice(window_sizes)
+                    j = random.randint(0,X.shape[0])
+                    k = random.randint(0, X.shape[1])
+
+                    p = (j,k,i)
+                    
+                    while p in observable_set or p in samples:
+
+                        i = random.choice(window_sizes)
+                        j = random.randint(0,X.shape[0])
+                        k = random.randint(0, X.shape[1])
+
+                        p = (j,k,i)
+                    observable_set.append(p)
+                    
+                tmp_Y = np.array(local_Y)
+                y_star = tmp_Y.min()
+                ms,covs = gpr.predict(observable_set,return_std=True)
+                # covs = kernel(observable_set,observable_set)
+                for i in range(len(observable_set)):
+                    m = ms[i]
+                    cov = covs[i]
+
+                    # print(f"Means: {m}")
+                    # print(f"Covariance: {cov}")
+                    
+                    var = multivariate_normal(mean=m , cov=cov)
+                    
+                    # print(m,cov.flatten())
+                    cov = cov.flatten()
+                    if cov != 0:
+                        ps = (m - y_star)/cov
+                    else:
+                        ps = 0
+                        
+                    pdf_eval = var.pdf(ps)
+                    cdf_eval = var.cdf(ps)
+                    # print(f"PS:{ps}")
+                    # print(f"PDF: {var.pdf(ps)}")
+                    # print(f"CDF: {var.cdf(ps)}")
+                    
+                    EI = (m-y_star)*cdf_eval + cov*pdf_eval
+                    EIs.append(EI)
+                    
+                EIs = np.array(EIs)
+                
+                print(f"EIs Min = {EIs.min()}")    
+                print(f"EIs Min = {observable_set[EIs.argmax()]}")  
+                
+                optimal_point = observable_set[EIs.argmax()]
+                
+                
+                
+                last_improvement = EIs.min()
+                
+            tmp_Y = np.array(local_Y)
+            optimal_point = local_X[tmp_Y.argmax()]
+            p = optimal_point
+            # gpr.predict()
+            whole_image = Q[:50176]
+            print(optimal_point[2])
+            optimal_box = []
+            for i in range(224):
+                for j in range(224):
+                    optimal_box.append((i,j,optimal_point[2]))
+            
+            m1,std2 = gpr.predict(whole_image,return_std=True)
+            m2,std2 = gpr.predict(optimal_box,return_std=True)
+            # salency_ratio = m1/m2
+            # salency_ratio = X/sample_from_D(X,p[0],p[1],p[2])
+            # show_image_from_matrix(X)
+            show_image_from_matrix(m2.reshape(224,224))
+            show_image_from_matrix(std2.reshape(224,224))
+
+## Using other libraries 
+def algorithm_attempt2(image_paths,max_window_size,M,transformer,N,init_length,kernel,observable_set_size= 500):
+    from xaitk_saliency.impls.gen_image_classifier_blackbox_sal.rise import RISEStack
+    from xaitk_saliency.impls.gen_image_classifier_blackbox_sal.slidingwindow import SlidingWindowStack
+
+    gen_slidingwindow = SlidingWindowStack((50, 50), (20, 20), threads=4)
+    gen_rise = RISEStack(1000, 8, 0.5, seed=0, threads=4, debiased=False)
+    gen_rise_debiased = RISEStack(1000, 8, 0.5, seed=0, threads=4, debiased=True)
+    window_sizes = [50,64,78,92,107,121,135,150]
+    t_M = test_model(M,transformer)
+    for data in image_paths.items():
+            samples = []
+            print(data)
+            image_path = data[0]
+            label = data[1]
+            
+            if label == None:
+                continue
+            
+            X = load_image_as_matrix(image_path)
+            Q = create_Q(X,max_window_size)
+            
+            f_X = evaluate_test_model(M,transformer,X,label[0])
+            app(
+                image_path,
+                t_M,
+                gen_rise,
+            )
+            
+            
+    pass            
 
 def main():
     parser = argparse.ArgumentParser(description="Image Dataset Loader")
@@ -165,9 +457,9 @@ def main():
 
     args = parser.parse_args()
     
-    init_length = 100
-    max_window_size = 200 + init_length
-    N = 1000
+    init_length = 20
+    max_window_size = 20 
+    N = 200
 
     if args.command == 'load':
         labels = load_labels(args.labels)
@@ -175,93 +467,12 @@ def main():
         kernel = 1.0 * Matern(length_scale=12, nu=2.5)
         M,transformer = load_test_model()
         
-        for data in image_paths.items():
-            samples = []
-            print(data)
-            image_path = data[0]
-            label = data[1]
-            if label == None:
-                continue
+        #Algorithm 2 currently works. Algorithm 1 fails.
+        
+        # algorithm_attempt1(image_paths,max_window_size,M,transformer,N,init_length,kernel)
+        algorithm_attempt2(image_paths,max_window_size,M,transformer,N,init_length,kernel)  
+      
             
-            X = load_image_as_matrix(image_path)
-            Q = create_Q(X,max_window_size)
-            
-            f_X = evaluate_test_model(M,transformer,X,label[0])
-            local_X = []
-            local_Y = []
-
-            
-
-            for c in tqdm.tqdm(range(N)):
-                
-
-                i = random.randint(1,max_window_size)
-                j = random.randint(0,X.shape[0])
-                k = random.randint(0, X.shape[1])
-
-                p = (j,k,i)
-
-                while p in samples:
-
-                    i = random.randint(1,max_window_size)
-                    j = random.randint(0,X.shape[0])
-                    k = random.randint(0, X.shape[1])
-
-                    p = (j,k,i)
-
-                samples.append(p)
-                X_hat = sample_from_D(X,i,j,k)
-                f_X_hat = evaluate_test_model(M,transformer,X_hat,label[0])
-
-                y_i = f_X - f_X_hat
-
-                local_Y.append(y_i)
-                local_X.append(p)
-                
-                
-                gpr = GaussianProcessRegressor(kernel=kernel, random_state=0).fit(local_X, local_Y)
-
-                A = random.sample(Q,1000)
-            
-                m,cov = gpr.predict(A,return_cov=True)
-                
-                var = multivariate_normal(mean=m , cov=cov)
-                print(cov.shape)
-                
-                                # Create a grid of points
-                x1 = np.linspace(0, 6, 50)
-                x2 = np.linspace(0, 6, 50)
-                X1, X2 = np.meshgrid(x1, x2)
-                grid_points = np.c_[X1.ravel(), X2.ravel()]
-
-
-                # Ensure the covariance matrix is positive definite
-                cov += 1e-10 * np.eye(cov.shape[0])
-
-                # Evaluate the PDF on the grid
-                pdf_values = np.zeros(X1.shape)
-
-                for i in range(len(grid_points)):
-                    # For each grid point, use the corresponding mean and the variance (diagonal of the covariance matrix)
-                    mean_i = m[i]
-                    cov_ii = cov[i, i]  # Variance of the i-th prediction
-                    print(multivariate_normal.pdf(grid_points[i], mean=mean_i, cov=cov_ii))
-                    pdf_values.ravel()[i] = multivariate_normal.pdf(grid_points[i], mean=mean_i, cov=cov_ii)
-
-                # Plot the PDF
-                plt.figure(figsize=(10, 8))
-                plt.contourf(X1, X2, pdf_values.reshape(X1.shape), levels=50, cmap='viridis')
-                plt.colorbar(label='PDF')
-                plt.scatter(local_X[:, 0], local_X[:, 1], c='red', marker='x', label='Training Points')
-                plt.xlabel('X1')
-                plt.ylabel('X2')
-                plt.title('PDF of Gaussian Process Predictions')
-                plt.legend()
-                plt.show()
-
-                # print(m,cov)
-                
-
     
     else:
         parser.print_help()
